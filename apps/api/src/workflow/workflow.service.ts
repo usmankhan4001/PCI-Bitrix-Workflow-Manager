@@ -26,9 +26,10 @@ const SETTING_DEFAULTS: Record<string, string> = {
   // the normal round-robin pipeline, same as a brand-new lead.
   DEAD_LEAD_STATUS_ID: 'UC_2H1LKX',   // "Dead Lead"
   DEAD_LEAD_RECYCLE_DAYS: '30',
+  DEAD_LEAD_RECYCLE_LIMIT: '75',      // max Dead leads recycled per hourly run — caps how many get redistributed to agents at once on a large backlog; leftovers just get picked up next hour
   JUNK_LEAD_STATUS_ID: 'UC_POEFNU',   // "Junk Lead" — distinct from STATUS_ID=JUNK ("Duplicate"), which the auto-merge feature sets and this must never touch
   JUNK_LEAD_RECYCLE_DAYS: '7',
-  RECYCLE_BATCH_LIMIT: '250',         // max leads recycled per status per hourly run — caps how many get redistributed to agents at once on a large backlog; leftovers just get picked up next hour
+  JUNK_LEAD_RECYCLE_LIMIT: '75',      // same idea, for Junk leads — combined cap across both is 150/hour by default
   SELF_CREATED_SOURCE_IDS: '[]',      // JSON array of Bitrix SOURCE_ID values that mean "agent made this lead themselves" — excluded from the workflow entirely
   ALLOWED_SOURCES: '[]',              // JSON array of source IDs eligible for assignment; empty = all sources allowed
   WORKFLOW_MANAGER_ID: '1',
@@ -1338,18 +1339,19 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
       return { deadRecycled: 0, junkRecycled: 0 };
     }
     const creds = this.getWebhookCreds();
-    const batchLimit = parseInt(settings.RECYCLE_BATCH_LIMIT || '250', 10);
 
     const deadStatus = settings.DEAD_LEAD_STATUS_ID || '';
     const deadDays = parseInt(settings.DEAD_LEAD_RECYCLE_DAYS || '30', 10);
+    const deadLimit = parseInt(settings.DEAD_LEAD_RECYCLE_LIMIT || '75', 10);
     const deadRecycled = deadStatus
-      ? await this.recycleLeadsInStatus(deadStatus, deadDays, batchLimit, settings, creds)
+      ? await this.recycleLeadsInStatus(deadStatus, deadDays, deadLimit, settings, creds)
       : 0;
 
     const junkStatus = settings.JUNK_LEAD_STATUS_ID || '';
     const junkDays = parseInt(settings.JUNK_LEAD_RECYCLE_DAYS || '7', 10);
+    const junkLimit = parseInt(settings.JUNK_LEAD_RECYCLE_LIMIT || '75', 10);
     const junkRecycled = junkStatus
-      ? await this.recycleLeadsInStatus(junkStatus, junkDays, batchLimit, settings, creds)
+      ? await this.recycleLeadsInStatus(junkStatus, junkDays, junkLimit, settings, creds)
       : 0;
 
     return { deadRecycled, junkRecycled };
