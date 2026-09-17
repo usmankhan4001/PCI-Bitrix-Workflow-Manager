@@ -28,6 +28,7 @@ const SETTING_DEFAULTS: Record<string, string> = {
   DEAD_LEAD_RECYCLE_DAYS: '30',
   JUNK_LEAD_STATUS_ID: 'UC_POEFNU',   // "Junk Lead" — distinct from STATUS_ID=JUNK ("Duplicate"), which the auto-merge feature sets and this must never touch
   JUNK_LEAD_RECYCLE_DAYS: '7',
+  RECYCLE_BATCH_LIMIT: '250',         // max leads recycled per status per hourly run — caps how many get redistributed to agents at once on a large backlog; leftovers just get picked up next hour
   SELF_CREATED_SOURCE_IDS: '[]',      // JSON array of Bitrix SOURCE_ID values that mean "agent made this lead themselves" — excluded from the workflow entirely
   ALLOWED_SOURCES: '[]',              // JSON array of source IDs eligible for assignment; empty = all sources allowed
   WORKFLOW_MANAGER_ID: '1',
@@ -1337,35 +1338,40 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
       return { deadRecycled: 0, junkRecycled: 0 };
     }
     const creds = this.getWebhookCreds();
+    const batchLimit = parseInt(settings.RECYCLE_BATCH_LIMIT || '250', 10);
 
     const deadStatus = settings.DEAD_LEAD_STATUS_ID || '';
     const deadDays = parseInt(settings.DEAD_LEAD_RECYCLE_DAYS || '30', 10);
     const deadRecycled = deadStatus
-      ? await this.recycleLeadsInStatus(deadStatus, deadDays, settings, creds)
+      ? await this.recycleLeadsInStatus(deadStatus, deadDays, batchLimit, settings, creds)
       : 0;
 
     const junkStatus = settings.JUNK_LEAD_STATUS_ID || '';
     const junkDays = parseInt(settings.JUNK_LEAD_RECYCLE_DAYS || '7', 10);
     const junkRecycled = junkStatus
-      ? await this.recycleLeadsInStatus(junkStatus, junkDays, settings, creds)
+      ? await this.recycleLeadsInStatus(junkStatus, junkDays, batchLimit, settings, creds)
       : 0;
 
     return { deadRecycled, junkRecycled };
   }
 
-  // Bulk-fetches every lead in `fromStatus` whose MOVED_TIME is older than
-  // `days`, using the >ID-cursor + start=-1 pagination pattern (disables
-  // Bitrix's slow `total` calculation, per Bitrix's own "Retrieve Large
-  // Volumes of Data" guidance) rather than plain start/50 paging — matters
-  // here since this can genuinely span more than one page.
+  // Bulk-fetches leads in `fromStatus` whose MOVED_TIME is older than `days`,
+  // using the >ID-cursor + start=-1 pagination pattern (disables Bitrix's
+  // slow `total` calculation, per Bitrix's own "Retrieve Large Volumes of
+  // Data" guidance) rather than plain start/50 paging. Stops once `limit` has
+  // been recycled this run — dumping an entire large backlog on agents in one
+  // hour would be its own problem. Nothing is lost by stopping early: a
+  // recycled lead's STATUS_ID is no longer `fromStatus`, so it drops out of
+  // this same query on its own; whatever's left over just still matches next
+  // hour, with no cursor/offset bookkeeping needed across runs.
   private async recycleLeadsInStatus(
-    fromStatus: string, days: number, settings: Record<string, string>, creds: BitrixCreds,
+    fromStatus: string, days: number, limit: number, settings: Record<string, string>, creds: BitrixCreds,
   ): Promise<number> {
     const cutoffIso = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
     let recycled = 0;
     let lastId = '0';
 
-    while (true) {
+    while (recycled < limit) {
       const params = new URLSearchParams();
       params.append('filter[STATUS_ID]', fromStatus);
       params.append('filter[<MOVED_TIME]', cutoffIso);
@@ -1391,6 +1397,7 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
       if (rows.length === 0) break;
 
       for (const row of rows) {
+        if (recycled >= limit) break;
         const leadId = String(row.ID);
         lastId = leadId;
         try {
@@ -1408,6 +1415,9 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
       // method/portal. The >ID cursor always advances past whatever was just
       // processed, so the only reliable end-of-data signal is an empty page
       // (the `rows.length === 0` check above), regardless of the real page size.
+    }
+    if (recycled >= limit) {
+      this.logger.log(`recycleLeadsInStatus(${fromStatus}): hit the ${limit}-per-run cap — remainder will continue next hour`);
     }
     return recycled;
   }
