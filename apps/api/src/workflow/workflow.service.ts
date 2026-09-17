@@ -1403,8 +1403,11 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
         // full assignment pipeline) — same throttling reasoning as the SLA sweep.
         await this.sleep(500);
       }
-
-      if (rows.length < 50) break;
+      // No "rows.length < N" early-exit here on purpose — that would assume a
+      // specific per-call page size, which isn't guaranteed to be 50 for every
+      // method/portal. The >ID cursor always advances past whatever was just
+      // processed, so the only reliable end-of-data signal is an empty page
+      // (the `rows.length === 0` check above), regardless of the real page size.
     }
     return recycled;
   }
