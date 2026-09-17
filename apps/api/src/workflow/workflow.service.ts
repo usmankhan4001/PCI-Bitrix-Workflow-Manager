@@ -21,6 +21,13 @@ const SETTING_DEFAULTS: Record<string, string> = {
   MAX_ROTATION_LAPS: '2',             // how many full laps through the active roster before escalating
   NEW_LEAD_STATUS_ID: 'NEW',          // Bitrix STATUS_ID that counts as "not yet worked" — any other value closes the SLA clock
   ASSIGNMENT_HISTORY_FIELD: 'UF_CRM_1787754199499', // Bitrix Lead custom field (JSON array) that logs every handoff — who held it, when, and why they stopped
+  // Stale-lead recycling — leads sitting untouched in these stages for the
+  // given number of days get moved back to NEW_LEAD_STATUS_ID and re-enter
+  // the normal round-robin pipeline, same as a brand-new lead.
+  DEAD_LEAD_STATUS_ID: 'UC_2H1LKX',   // "Dead Lead"
+  DEAD_LEAD_RECYCLE_DAYS: '30',
+  JUNK_LEAD_STATUS_ID: 'UC_POEFNU',   // "Junk Lead" — distinct from STATUS_ID=JUNK ("Duplicate"), which the auto-merge feature sets and this must never touch
+  JUNK_LEAD_RECYCLE_DAYS: '7',
   SELF_CREATED_SOURCE_IDS: '[]',      // JSON array of Bitrix SOURCE_ID values that mean "agent made this lead themselves" — excluded from the workflow entirely
   ALLOWED_SOURCES: '[]',              // JSON array of source IDs eligible for assignment; empty = all sources allowed
   WORKFLOW_MANAGER_ID: '1',
@@ -851,7 +858,7 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
     team: string | undefined,
     creds: BitrixCreds,
     force = false,
-    opts: { skipHoursCheck?: boolean } = {},
+    opts: { skipHoursCheck?: boolean; isRecycle?: boolean } = {},
   ): Promise<{ success: boolean; agent?: any; skipped?: boolean; queued?: boolean; message?: string }> {
     const settings = await this.getSettings();
 
@@ -874,14 +881,16 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
       // WhatsApp/log row when nothing has actually changed — no matter how we
       // got here (a retried webhook delivery, or a Bitrix ONCRMLEADUPDATE event
       // that merely touches an already-assigned lead rather than genuinely
-      // reassigning it). Bypassed by force=true, and irrelevant once the lead
-      // is being manually reassigned (that path goes through
-      // handleLeadChangeWebhook → assignToAgent directly, not here).
+      // reassigning it). Bypassed by force=true, and by isRecycle=true (a stale
+      // lead being reintroduced after weeks/months necessarily already has an
+      // old AssignmentLog row — that's expected here, not a retry to ignore).
+      // Irrelevant once the lead is being manually reassigned (that path goes
+      // through handleLeadChangeWebhook → assignToAgent directly, not here).
       const existingLog = await this.assignmentLog.findFirst({
         where: { lead_id: cleanLeadId },
         orderBy: { assigned_at: 'desc' },
       });
-      if (existingLog && !force) {
+      if (existingLog && !force && !opts.isRecycle) {
         this.logger.log(`Lead #${cleanLeadId} is already assigned to ${existingLog.agent_name}. Skipping duplicate assignment.`);
         return { success: true, skipped: true, message: `Lead already assigned to ${existingLog.agent_name}` };
       }
@@ -1308,6 +1317,115 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // ─── Stale-lead recycling — called by CronService once an hour ────────────
+  // Leads sitting untouched (STATUS_ID unchanged, per MOVED_TIME) in the Dead
+  // or Junk Lead stage for the configured number of days get moved back to
+  // "New Lead" and re-enter the normal pipeline — self-created/source/
+  // duplicate/business-hours checks, round-robin assignment, SLA rotation,
+  // notifications — exactly as if they'd just arrived fresh. Deliberately
+  // scoped to DEAD_LEAD_STATUS_ID/JUNK_LEAD_STATUS_ID only — never touches
+  // STATUS_ID=JUNK ("Duplicate"), which the auto-merge feature sets on a
+  // lead it deliberately closed; recycling that one back to New would
+  // silently undo the merge a week later.
+
+  async recycleStaleLeads(): Promise<{ deadRecycled: number; junkRecycled: number }> {
+    const settings = await this.getSettings();
+    if (settings.WORKFLOW_ENABLED !== 'true') {
+      this.logger.log('Stale-lead recycle skipped — workflow engine is paused');
+      return { deadRecycled: 0, junkRecycled: 0 };
+    }
+    const creds = this.getWebhookCreds();
+
+    const deadStatus = settings.DEAD_LEAD_STATUS_ID || '';
+    const deadDays = parseInt(settings.DEAD_LEAD_RECYCLE_DAYS || '30', 10);
+    const deadRecycled = deadStatus
+      ? await this.recycleLeadsInStatus(deadStatus, deadDays, settings, creds)
+      : 0;
+
+    const junkStatus = settings.JUNK_LEAD_STATUS_ID || '';
+    const junkDays = parseInt(settings.JUNK_LEAD_RECYCLE_DAYS || '7', 10);
+    const junkRecycled = junkStatus
+      ? await this.recycleLeadsInStatus(junkStatus, junkDays, settings, creds)
+      : 0;
+
+    return { deadRecycled, junkRecycled };
+  }
+
+  // Bulk-fetches every lead in `fromStatus` whose MOVED_TIME is older than
+  // `days`, using the >ID-cursor + start=-1 pagination pattern (disables
+  // Bitrix's slow `total` calculation, per Bitrix's own "Retrieve Large
+  // Volumes of Data" guidance) rather than plain start/50 paging — matters
+  // here since this can genuinely span more than one page.
+  private async recycleLeadsInStatus(
+    fromStatus: string, days: number, settings: Record<string, string>, creds: BitrixCreds,
+  ): Promise<number> {
+    const cutoffIso = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
+    let recycled = 0;
+    let lastId = '0';
+
+    while (true) {
+      const params = new URLSearchParams();
+      params.append('filter[STATUS_ID]', fromStatus);
+      params.append('filter[<MOVED_TIME]', cutoffIso);
+      params.append('filter[>ID]', lastId);
+      params.append('order[ID]', 'ASC');
+      params.append('select[]', 'ID');
+      params.append('start', '-1');
+
+      let rows: any[] = [];
+      try {
+        const sep = this.bitrixUrl('crm.lead.list', creds).includes('?') ? '&' : '?';
+        const res = await fetch(`${this.bitrixUrl('crm.lead.list', creds)}${sep}${params.toString()}`);
+        const data = (await res.json()) as any;
+        if (data.error) {
+          this.logger.warn(`recycleLeadsInStatus(${fromStatus}) list failed: ${data.error_description || data.error}`);
+          break;
+        }
+        rows = data.result || [];
+      } catch (err) {
+        this.logger.error(`recycleLeadsInStatus(${fromStatus}) list failed: ${(err as Error).message}`);
+        break;
+      }
+      if (rows.length === 0) break;
+
+      for (const row of rows) {
+        const leadId = String(row.ID);
+        lastId = leadId;
+        try {
+          await this.recycleOneLead(leadId, fromStatus, days, settings, creds);
+          recycled++;
+        } catch (err) {
+          this.logger.error(`recycleLeadsInStatus(${fromStatus}): failed to recycle #${leadId}: ${(err as Error).message}`);
+        }
+        // Each lead fires several Bitrix calls (status update, comment, then the
+        // full assignment pipeline) — same throttling reasoning as the SLA sweep.
+        await this.sleep(500);
+      }
+
+      if (rows.length < 50) break;
+    }
+    return recycled;
+  }
+
+  private async recycleOneLead(
+    leadId: string, fromStatus: string, days: number, settings: Record<string, string>, creds: BitrixCreds,
+  ): Promise<void> {
+    const newStatus = settings.NEW_LEAD_STATUS_ID || 'NEW';
+    await this.updateLeadStatus(leadId, newStatus, creds);
+    await this.addTimelineComment(
+      leadId,
+      `Auto-recycled back to "New Lead" — sat in this stage for ${days}+ days with no activity.`,
+      creds,
+    );
+    this.logger.log(`Lead #${leadId} recycled from status "${fromStatus}" (${days}+ days stale) → "${newStatus}"`);
+    // isRecycle bypasses the "already assigned" idempotency guard — a lead
+    // sitting stale for weeks/months necessarily already has an old
+    // AssignmentLog row, which is expected here, not a retry to ignore.
+    // Everything else runs exactly like a fresh lead: self-created/source/
+    // duplicate/business-hours checks, then round-robin + SLA rotation start.
+    await this.processLeadAssignment(leadId, undefined, creds, false, { isRecycle: true });
   }
 
   // ─── SLA rotation sweep — called by CronService every couple of minutes ────

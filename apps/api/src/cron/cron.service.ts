@@ -12,6 +12,7 @@ export class CronService {
   // than double up.
   private processingLateLeads = false;
   private sweepingRotations = false;
+  private recyclingStaleLeads = false;
 
   constructor(private readonly workflow: WorkflowService) {}
 
@@ -75,6 +76,29 @@ export class CronService {
       }
     } finally {
       this.sweepingRotations = false;
+    }
+  }
+
+  /**
+   * Stale-lead recycling — runs once an hour, on the hour. Leads sitting
+   * untouched in the Dead Lead or Junk Lead stage past the configured number
+   * of days get moved back to "New Lead" and re-enter the full pipeline
+   * (round-robin, SLA rotation, notifications) as if freshly created.
+   */
+  @Cron('0 * * * *')
+  async recycleStaleLeads() {
+    if (this.recyclingStaleLeads) {
+      this.logger.warn('Stale-lead recycle tick skipped — previous run is still in progress');
+      return;
+    }
+    this.recyclingStaleLeads = true;
+    try {
+      const result = await this.workflow.recycleStaleLeads();
+      if (result.deadRecycled || result.junkRecycled) {
+        this.logger.log(`♻️ Stale-lead recycle — dead: ${result.deadRecycled}, junk: ${result.junkRecycled}`);
+      }
+    } finally {
+      this.recyclingStaleLeads = false;
     }
   }
 }

@@ -89,6 +89,11 @@ export class WorkflowController {
   @Post('rotations/sweep')
   sweepRotations() { return this.workflowService.sweepRotationTimeouts(); }
 
+  // ─── Stale-lead recycling (manual trigger — useful for testing/recovery) ──
+
+  @Post('recycle-stale-leads')
+  recycleStaleLeads() { return this.workflowService.recycleStaleLeads(); }
+
   // ─── Workflow Status (dashboard snapshot) ──────────────────────────────────
 
   @Get('status')
