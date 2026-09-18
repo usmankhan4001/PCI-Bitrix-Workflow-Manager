@@ -92,7 +92,7 @@ export class WorkflowController {
   // ─── Stale-lead recycling (manual trigger — useful for testing/recovery) ──
 
   @Post('recycle-stale-leads')
-  recycleStaleLeads() { return this.workflowService.recycleStaleLeads(); }
+  recycleStaleLeads() { return this.workflowService.recycleStaleLeads(true); }
 
   // ─── Workflow Status (dashboard snapshot) ──────────────────────────────────
 

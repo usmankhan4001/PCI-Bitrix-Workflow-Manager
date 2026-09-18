@@ -515,6 +515,45 @@ const Settings: React.FC = () => {
             </div>
           </Section>
 
+          {/* Stale-Lead Recycling */}
+          <Section
+            icon={<svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>}
+            title="Stale-Lead Recycling"
+            desc="Leads stuck in Dead Lead or Junk Lead for too long get reset to New Lead and re-enter the normal pipeline"
+          >
+            <FormRow
+              label="Recycling enabled"
+              desc="Turn off to stop this feature entirely, independent of the main engine toggle above."
+              right={
+                <button
+                  onClick={() => save('RECYCLE_ENABLED', settings.RECYCLE_ENABLED === 'true' ? 'false' : 'true')}
+                  disabled={saving === 'RECYCLE_ENABLED'}
+                  className="b24-toggle"
+                  style={{ background: settings.RECYCLE_ENABLED === 'true' ? 'var(--b24-green)' : '#3a3a3a' }}
+                >
+                  <span className="b24-toggle-knob" style={{ left: settings.RECYCLE_ENABLED === 'true' ? 23 : 3 }} />
+                </button>
+              }
+            />
+            <FormRow
+              label="Check Frequency"
+              desc="How often the recycle sweep actually runs."
+              tip="The cron checks every hour whether it's time to run, but only actually recycles anything once this many hours have passed since the last run. 24 = once daily, 1 = every hour."
+              right={<><input type="number" min={1} max={168} value={settings.RECYCLE_FREQUENCY_HOURS || '24'} onChange={e => setSettings(s => ({ ...s, RECYCLE_FREQUENCY_HOURS: e.target.value }))} className="b24-input" style={{ width: 72, textAlign: 'center' }} /><span style={{ fontSize: 12, color: 'var(--b24-text-faint)', marginRight: 8 }}>hours</span><SaveBtn onClick={() => save('RECYCLE_FREQUENCY_HOURS', settings.RECYCLE_FREQUENCY_HOURS || '24')} saving={saving === 'RECYCLE_FREQUENCY_HOURS'} /></>}
+            />
+            <FormRow
+              label="Dead Lead → New Lead after"
+              desc="Days with no stage change before a Dead Lead gets recycled."
+              right={<><input type="number" min={1} max={365} value={settings.DEAD_LEAD_RECYCLE_DAYS || '90'} onChange={e => setSettings(s => ({ ...s, DEAD_LEAD_RECYCLE_DAYS: e.target.value }))} className="b24-input" style={{ width: 72, textAlign: 'center' }} /><span style={{ fontSize: 12, color: 'var(--b24-text-faint)', marginRight: 8 }}>days</span><SaveBtn onClick={() => save('DEAD_LEAD_RECYCLE_DAYS', settings.DEAD_LEAD_RECYCLE_DAYS || '90')} saving={saving === 'DEAD_LEAD_RECYCLE_DAYS'} /></>}
+            />
+            <FormRow
+              label="Junk Lead → New Lead after"
+              desc="Days with no stage change before a Junk Lead gets recycled."
+              tip="This is the status literally named 'Junk Lead' — separate from the 'Duplicate' status the auto-merge feature sets, which is never touched by this."
+              right={<><input type="number" min={1} max={365} value={settings.JUNK_LEAD_RECYCLE_DAYS || '7'} onChange={e => setSettings(s => ({ ...s, JUNK_LEAD_RECYCLE_DAYS: e.target.value }))} className="b24-input" style={{ width: 72, textAlign: 'center' }} /><span style={{ fontSize: 12, color: 'var(--b24-text-faint)', marginRight: 8 }}>days</span><SaveBtn onClick={() => save('JUNK_LEAD_RECYCLE_DAYS', settings.JUNK_LEAD_RECYCLE_DAYS || '7')} saving={saving === 'JUNK_LEAD_RECYCLE_DAYS'} /></>}
+            />
+          </Section>
+
           {/* Escalation Manager */}
           <Section
             icon={<svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" /></svg>}

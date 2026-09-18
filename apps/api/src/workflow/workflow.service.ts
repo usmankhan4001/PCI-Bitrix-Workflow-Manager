@@ -24,12 +24,14 @@ const SETTING_DEFAULTS: Record<string, string> = {
   // Stale-lead recycling — leads sitting untouched in these stages for the
   // given number of days get moved back to NEW_LEAD_STATUS_ID and re-enter
   // the normal round-robin pipeline, same as a brand-new lead.
+  RECYCLE_ENABLED: 'true',            // dedicated on/off switch for this feature — independent of the master WORKFLOW_ENABLED pause
+  RECYCLE_FREQUENCY_HOURS: '24',      // how often the recycle sweep actually runs (the cron ticks hourly to check, but only acts once this many hours have passed since the last run) — 24 = once daily
   DEAD_LEAD_STATUS_ID: 'UC_2H1LKX',   // "Dead Lead"
-  DEAD_LEAD_RECYCLE_DAYS: '30',
-  DEAD_LEAD_RECYCLE_LIMIT: '75',      // max Dead leads recycled per hourly run — caps how many get redistributed to agents at once on a large backlog; leftovers just get picked up next hour
+  DEAD_LEAD_RECYCLE_DAYS: '90',       // ~3 months
+  DEAD_LEAD_RECYCLE_LIMIT: '75',      // max Dead leads recycled per run — caps how many get redistributed to agents at once on a large backlog; leftovers just get picked up next run
   JUNK_LEAD_STATUS_ID: 'UC_POEFNU',   // "Junk Lead" — distinct from STATUS_ID=JUNK ("Duplicate"), which the auto-merge feature sets and this must never touch
   JUNK_LEAD_RECYCLE_DAYS: '7',
-  JUNK_LEAD_RECYCLE_LIMIT: '75',      // same idea, for Junk leads — combined cap across both is 150/hour by default
+  JUNK_LEAD_RECYCLE_LIMIT: '75',      // same idea, for Junk leads — combined cap across both is 150/run by default
   SELF_CREATED_SOURCE_IDS: '[]',      // JSON array of Bitrix SOURCE_ID values that mean "agent made this lead themselves" — excluded from the workflow entirely
   ALLOWED_SOURCES: '[]',              // JSON array of source IDs eligible for assignment; empty = all sources allowed
   WORKFLOW_MANAGER_ID: '1',
@@ -1332,12 +1334,31 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
   // lead it deliberately closed; recycling that one back to New would
   // silently undo the merge a week later.
 
-  async recycleStaleLeads(): Promise<{ deadRecycled: number; junkRecycled: number }> {
+  // force=true (the manual trigger endpoint) bypasses the frequency gate only
+  // — RECYCLE_ENABLED and WORKFLOW_ENABLED still apply, since those mean
+  // "don't do this at all," not "don't do this yet."
+  async recycleStaleLeads(force = false): Promise<{ deadRecycled: number; junkRecycled: number; skipped?: boolean }> {
     const settings = await this.getSettings();
     if (settings.WORKFLOW_ENABLED !== 'true') {
       this.logger.log('Stale-lead recycle skipped — workflow engine is paused');
-      return { deadRecycled: 0, junkRecycled: 0 };
+      return { deadRecycled: 0, junkRecycled: 0, skipped: true };
     }
+    if (settings.RECYCLE_ENABLED !== 'true') {
+      this.logger.log('Stale-lead recycle skipped — RECYCLE_ENABLED is off');
+      return { deadRecycled: 0, junkRecycled: 0, skipped: true };
+    }
+
+    if (!force) {
+      const frequencyHours = parseInt(settings.RECYCLE_FREQUENCY_HOURS || '24', 10);
+      const lastRunAt = settings.RECYCLE_LAST_RUN_AT ? new Date(settings.RECYCLE_LAST_RUN_AT) : null;
+      if (lastRunAt) {
+        const hoursSinceLastRun = (Date.now() - lastRunAt.getTime()) / 3600000;
+        if (hoursSinceLastRun < frequencyHours) {
+          return { deadRecycled: 0, junkRecycled: 0, skipped: true };
+        }
+      }
+    }
+
     const creds = this.getWebhookCreds();
 
     const deadStatus = settings.DEAD_LEAD_STATUS_ID || '';
@@ -1354,6 +1375,7 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
       ? await this.recycleLeadsInStatus(junkStatus, junkDays, junkLimit, settings, creds)
       : 0;
 
+    await this.updateSetting('RECYCLE_LAST_RUN_AT', new Date().toISOString());
     return { deadRecycled, junkRecycled };
   }
 
