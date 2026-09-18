@@ -519,7 +519,7 @@ const Settings: React.FC = () => {
           <Section
             icon={<svg width="17" height="17" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>}
             title="Stale-Lead Recycling"
-            desc="Leads stuck in Dead Lead or Junk Lead for too long get reset to New Lead and re-enter the normal pipeline"
+            desc="Leads stuck in Dead Lead or Junk Lead for too long get moved to Reshuffle and round-robin assigned — a one-time reassignment, no duplicate check, no SLA timer, no auto-rotation"
           >
             <FormRow
               label="Recycling enabled"
@@ -538,19 +538,29 @@ const Settings: React.FC = () => {
             <FormRow
               label="Check Frequency"
               desc="How often the recycle sweep actually runs."
-              tip="The cron checks every hour whether it's time to run, but only actually recycles anything once this many hours have passed since the last run. 24 = once daily, 1 = every hour."
+              tip="The cron checks every hour whether it's time to run, but only actually recycles anything once this many hours have passed since the last run AND it's currently business hours. 24 = once daily, 1 = every hour."
               right={<><input type="number" min={1} max={168} value={settings.RECYCLE_FREQUENCY_HOURS || '24'} onChange={e => setSettings(s => ({ ...s, RECYCLE_FREQUENCY_HOURS: e.target.value }))} className="b24-input" style={{ width: 72, textAlign: 'center' }} /><span style={{ fontSize: 12, color: 'var(--b24-text-faint)', marginRight: 8 }}>hours</span><SaveBtn onClick={() => save('RECYCLE_FREQUENCY_HOURS', settings.RECYCLE_FREQUENCY_HOURS || '24')} saving={saving === 'RECYCLE_FREQUENCY_HOURS'} /></>}
             />
             <FormRow
-              label="Dead Lead → New Lead after"
-              desc="Days with no stage change before a Dead Lead gets recycled."
+              label="Dead Lead → Reshuffle after"
+              desc="Days with no stage change before a Dead Lead gets recycled and round-robin assigned. Capped per run below."
               right={<><input type="number" min={1} max={365} value={settings.DEAD_LEAD_RECYCLE_DAYS || '90'} onChange={e => setSettings(s => ({ ...s, DEAD_LEAD_RECYCLE_DAYS: e.target.value }))} className="b24-input" style={{ width: 72, textAlign: 'center' }} /><span style={{ fontSize: 12, color: 'var(--b24-text-faint)', marginRight: 8 }}>days</span><SaveBtn onClick={() => save('DEAD_LEAD_RECYCLE_DAYS', settings.DEAD_LEAD_RECYCLE_DAYS || '90')} saving={saving === 'DEAD_LEAD_RECYCLE_DAYS'} /></>}
             />
             <FormRow
-              label="Junk Lead → New Lead after"
-              desc="Days with no stage change before a Junk Lead gets recycled."
+              label="Dead Lead cap per run"
+              desc="Max Dead leads recycled in one run — the rest wait for the next run rather than flooding agents at once."
+              right={<><input type="number" min={1} max={2000} value={settings.DEAD_LEAD_RECYCLE_LIMIT || '220'} onChange={e => setSettings(s => ({ ...s, DEAD_LEAD_RECYCLE_LIMIT: e.target.value }))} className="b24-input" style={{ width: 72, textAlign: 'center' }} /><SaveBtn onClick={() => save('DEAD_LEAD_RECYCLE_LIMIT', settings.DEAD_LEAD_RECYCLE_LIMIT || '220')} saving={saving === 'DEAD_LEAD_RECYCLE_LIMIT'} /></>}
+            />
+            <FormRow
+              label="Junk Lead → Reshuffle after"
+              desc="Days with no stage change before a Junk Lead gets recycled and round-robin assigned."
               tip="This is the status literally named 'Junk Lead' — separate from the 'Duplicate' status the auto-merge feature sets, which is never touched by this."
               right={<><input type="number" min={1} max={365} value={settings.JUNK_LEAD_RECYCLE_DAYS || '7'} onChange={e => setSettings(s => ({ ...s, JUNK_LEAD_RECYCLE_DAYS: e.target.value }))} className="b24-input" style={{ width: 72, textAlign: 'center' }} /><span style={{ fontSize: 12, color: 'var(--b24-text-faint)', marginRight: 8 }}>days</span><SaveBtn onClick={() => save('JUNK_LEAD_RECYCLE_DAYS', settings.JUNK_LEAD_RECYCLE_DAYS || '7')} saving={saving === 'JUNK_LEAD_RECYCLE_DAYS'} /></>}
+            />
+            <FormRow
+              label="Junk Lead cap per run"
+              desc="Max Junk leads recycled in one run — combined with the Dead cap above, up to both totals get reassigned per run."
+              right={<><input type="number" min={1} max={2000} value={settings.JUNK_LEAD_RECYCLE_LIMIT || '220'} onChange={e => setSettings(s => ({ ...s, JUNK_LEAD_RECYCLE_LIMIT: e.target.value }))} className="b24-input" style={{ width: 72, textAlign: 'center' }} /><SaveBtn onClick={() => save('JUNK_LEAD_RECYCLE_LIMIT', settings.JUNK_LEAD_RECYCLE_LIMIT || '220')} saving={saving === 'JUNK_LEAD_RECYCLE_LIMIT'} /></>}
             />
           </Section>
 

@@ -95,6 +95,29 @@ export class WhatsappService {
     return this.sendText(agentPhone, text);
   }
 
+  /**
+   * Notify an agent a recycled (Dead/Junk) lead was reassigned to them via
+   * the Reshuffle round-robin. Deliberately no deadline/timer language — this
+   * is a one-time, permanent reassignment, not an SLA-tracked one.
+   */
+  async sendReshuffleNotification(
+    agentPhone: string,
+    agentName: string,
+    leadName: string,
+    leadContact: string,
+    source = '',
+  ): Promise<boolean> {
+    const text =
+      `🔄 *Recycled lead reassigned to you*\n\n` +
+      `👤 Agent: ${agentName}\n` +
+      `📋 Lead: ${leadName}\n` +
+      `📞 Contact: ${leadContact || 'N/A'}\n` +
+      `🌐 Source: ${source || 'N/A'}\n\n` +
+      `This lead was previously stuck and has been reassigned to you. No auto-timer on this one — please follow up when you can.`;
+
+    return this.sendText(agentPhone, text);
+  }
+
   /** Notify the Escalation Manager that a lead has landed with them. */
   async sendEscalationNotification(
     managerPhone: string,

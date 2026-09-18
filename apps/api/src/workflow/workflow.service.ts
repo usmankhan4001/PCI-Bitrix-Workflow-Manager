@@ -22,16 +22,19 @@ const SETTING_DEFAULTS: Record<string, string> = {
   NEW_LEAD_STATUS_ID: 'NEW',          // Bitrix STATUS_ID that counts as "not yet worked" — any other value closes the SLA clock
   ASSIGNMENT_HISTORY_FIELD: 'UF_CRM_1787754199499', // Bitrix Lead custom field (JSON array) that logs every handoff — who held it, when, and why they stopped
   // Stale-lead recycling — leads sitting untouched in these stages for the
-  // given number of days get moved back to NEW_LEAD_STATUS_ID and re-enter
-  // the normal round-robin pipeline, same as a brand-new lead.
+  // given number of days get moved to RECYCLE_TARGET_STATUS_ID ("Reshuffle")
+  // and round-robin assigned to the next agent — a one-time, permanent
+  // reassignment with no SLA tracking, not the same pipeline a fresh lead
+  // gets (no duplicate check, no rotation, no timeout).
   RECYCLE_ENABLED: 'true',            // dedicated on/off switch for this feature — independent of the master WORKFLOW_ENABLED pause
   RECYCLE_FREQUENCY_HOURS: '24',      // how often the recycle sweep actually runs (the cron ticks hourly to check, but only acts once this many hours have passed since the last run) — 24 = once daily
+  RECYCLE_TARGET_STATUS_ID: 'UC_DFJO3G', // "Reshuffle" — dedicated destination stage for recycled leads, distinct from "New Lead"
   DEAD_LEAD_STATUS_ID: 'UC_2H1LKX',   // "Dead Lead"
   DEAD_LEAD_RECYCLE_DAYS: '90',       // ~3 months
-  DEAD_LEAD_RECYCLE_LIMIT: '75',      // max Dead leads recycled per run — caps how many get redistributed to agents at once on a large backlog; leftovers just get picked up next run
+  DEAD_LEAD_RECYCLE_LIMIT: '220',     // max Dead leads recycled per run — caps how many get redistributed to agents at once on a large backlog; leftovers just get picked up next run
   JUNK_LEAD_STATUS_ID: 'UC_POEFNU',   // "Junk Lead" — distinct from STATUS_ID=JUNK ("Duplicate"), which the auto-merge feature sets and this must never touch
   JUNK_LEAD_RECYCLE_DAYS: '7',
-  JUNK_LEAD_RECYCLE_LIMIT: '75',      // same idea, for Junk leads — combined cap across both is 150/run by default
+  JUNK_LEAD_RECYCLE_LIMIT: '220',     // same idea, for Junk leads — combined cap across both is 440/run by default
   SELF_CREATED_SOURCE_IDS: '[]',      // JSON array of Bitrix SOURCE_ID values that mean "agent made this lead themselves" — excluded from the workflow entirely
   ALLOWED_SOURCES: '[]',              // JSON array of source IDs eligible for assignment; empty = all sources allowed
   WORKFLOW_MANAGER_ID: '1',
@@ -862,7 +865,7 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
     team: string | undefined,
     creds: BitrixCreds,
     force = false,
-    opts: { skipHoursCheck?: boolean; isRecycle?: boolean } = {},
+    opts: { skipHoursCheck?: boolean } = {},
   ): Promise<{ success: boolean; agent?: any; skipped?: boolean; queued?: boolean; message?: string }> {
     const settings = await this.getSettings();
 
@@ -885,16 +888,15 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
       // WhatsApp/log row when nothing has actually changed — no matter how we
       // got here (a retried webhook delivery, or a Bitrix ONCRMLEADUPDATE event
       // that merely touches an already-assigned lead rather than genuinely
-      // reassigning it). Bypassed by force=true, and by isRecycle=true (a stale
-      // lead being reintroduced after weeks/months necessarily already has an
-      // old AssignmentLog row — that's expected here, not a retry to ignore).
-      // Irrelevant once the lead is being manually reassigned (that path goes
-      // through handleLeadChangeWebhook → assignToAgent directly, not here).
+      // reassigning it). Bypassed by force=true. Irrelevant once the lead is
+      // being manually reassigned (that path goes through
+      // handleLeadChangeWebhook → assignToAgent directly, not here) or
+      // recycled (recycleOneLead assigns directly too, not through here).
       const existingLog = await this.assignmentLog.findFirst({
         where: { lead_id: cleanLeadId },
         orderBy: { assigned_at: 'desc' },
       });
-      if (existingLog && !force && !opts.isRecycle) {
+      if (existingLog && !force) {
         this.logger.log(`Lead #${cleanLeadId} is already assigned to ${existingLog.agent_name}. Skipping duplicate assignment.`);
         return { success: true, skipped: true, message: `Lead already assigned to ${existingLog.agent_name}` };
       }
@@ -1325,18 +1327,18 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
 
   // ─── Stale-lead recycling — called by CronService once an hour ────────────
   // Leads sitting untouched (STATUS_ID unchanged, per MOVED_TIME) in the Dead
-  // or Junk Lead stage for the configured number of days get moved back to
-  // "New Lead" and re-enter the normal pipeline — self-created/source/
-  // duplicate/business-hours checks, round-robin assignment, SLA rotation,
-  // notifications — exactly as if they'd just arrived fresh. Deliberately
-  // scoped to DEAD_LEAD_STATUS_ID/JUNK_LEAD_STATUS_ID only — never touches
+  // or Junk Lead stage for the configured number of days get moved to
+  // RECYCLE_TARGET_STATUS_ID ("Reshuffle") and round-robin assigned to the
+  // next agent — a one-time, permanent reassignment: no duplicate check, no
+  // SLA tracking, no auto-rotation. Deliberately scoped to
+  // DEAD_LEAD_STATUS_ID/JUNK_LEAD_STATUS_ID only — never touches
   // STATUS_ID=JUNK ("Duplicate"), which the auto-merge feature sets on a
-  // lead it deliberately closed; recycling that one back to New would
-  // silently undo the merge a week later.
+  // lead it deliberately closed; recycling that one would silently undo the
+  // merge a week later.
 
-  // force=true (the manual trigger endpoint) bypasses the frequency gate only
-  // — RECYCLE_ENABLED and WORKFLOW_ENABLED still apply, since those mean
-  // "don't do this at all," not "don't do this yet."
+  // force=true (the manual trigger endpoint) bypasses the frequency and
+  // business-hours gates — RECYCLE_ENABLED and WORKFLOW_ENABLED still apply,
+  // since those mean "don't do this at all," not "not right now."
   async recycleStaleLeads(force = false): Promise<{ deadRecycled: number; junkRecycled: number; skipped?: boolean }> {
     const settings = await this.getSettings();
     if (settings.WORKFLOW_ENABLED !== 'true') {
@@ -1356,6 +1358,14 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
         if (hoursSinceLastRun < frequencyHours) {
           return { deadRecycled: 0, junkRecycled: 0, skipped: true };
         }
+      }
+      // Leads are being actively reassigned to agents here — wait for the
+      // window to open rather than dumping a batch of reshuffled leads on
+      // nobody. Not updating RECYCLE_LAST_RUN_AT means the hourly tick keeps
+      // retrying until hours open, instead of losing a whole day.
+      if (!this.isWithinBusinessHours(settings)) {
+        this.logger.log('Stale-lead recycle skipped — outside business hours, will retry next hour');
+        return { deadRecycled: 0, junkRecycled: 0, skipped: true };
       }
     }
 
@@ -1446,23 +1456,65 @@ export class WorkflowService extends PrismaClient implements OnModuleInit, OnMod
     return recycled;
   }
 
+  // Deliberately does NOT go through processLeadAssignment/assignToAgent —
+  // this is a one-time, permanent round-robin reassignment, not the full
+  // fresh-lead pipeline: no duplicate scan, no LeadRotation row, no SLA
+  // timer, no auto-rotation to the next agent if this one doesn't act.
   private async recycleOneLead(
     leadId: string, fromStatus: string, days: number, settings: Record<string, string>, creds: BitrixCreds,
   ): Promise<void> {
-    const newStatus = settings.NEW_LEAD_STATUS_ID || 'NEW';
-    await this.updateLeadStatus(leadId, newStatus, creds);
+    const targetStatus = settings.RECYCLE_TARGET_STATUS_ID || 'UC_DFJO3G';
+    const lead = await this.fetchLeadDetails(leadId, creds);
+
+    if (this.isSelfCreatedSource(lead.sourceId, settings)) {
+      this.logger.log(`Lead #${leadId} skipped for recycling — self-created source "${lead.sourceId}"`);
+      return;
+    }
+
+    await this.updateLeadStatus(leadId, targetStatus, creds);
     await this.addTimelineComment(
       leadId,
-      `Auto-recycled back to "New Lead" — sat in this stage for ${days}+ days with no activity.`,
+      `Auto-recycled — sat in this stage for ${days}+ days with no activity. Redistributed via round-robin; no auto-timer on this one.`,
       creds,
     );
-    this.logger.log(`Lead #${leadId} recycled from status "${fromStatus}" (${days}+ days stale) → "${newStatus}"`);
-    // isRecycle bypasses the "already assigned" idempotency guard — a lead
-    // sitting stale for weeks/months necessarily already has an old
-    // AssignmentLog row, which is expected here, not a retry to ignore.
-    // Everything else runs exactly like a fresh lead: self-created/source/
-    // duplicate/business-hours checks, then round-robin + SLA rotation start.
-    await this.processLeadAssignment(leadId, undefined, creds, false, { isRecycle: true });
+    this.logger.log(`Lead #${leadId} recycled from status "${fromStatus}" (${days}+ days stale) → "${targetStatus}"`);
+
+    const team = this.resolveTeamForSource(lead.sourceId, settings);
+    const agent = await this.pickNextAgent(team);
+    if (!agent) {
+      this.logger.warn(`Lead #${leadId} moved to "${targetStatus}" but no active agent in team "${team}" — left unassigned`);
+      return;
+    }
+
+    await this.assignLeadInBitrix(leadId, agent.bitrix_user_id, creds);
+    await this.setKnownOwner(leadId, agent.bitrix_user_id);
+    await this.assignmentLog.upsert({
+      where: { lead_id_agent_id: { lead_id: leadId, agent_id: agent.id || 'manual-assignee' } },
+      update: {},
+      create: { lead_id: leadId, agent_id: agent.id || 'manual-assignee', agent_name: agent.name, team },
+    });
+    // lap=0, previousOutcome=null: no lap-based tracking applies here, and
+    // whatever holding period preceded this (however long it sat stale) has
+    // no classified outcome — it's just closed out.
+    await this.recordAssignmentHandoff(leadId, agent.bitrix_user_id, 0, null, settings, creds);
+    await this.notifyReshuffledAgent(agent, lead, settings, creds);
+  }
+
+  private async notifyReshuffledAgent(
+    agent: any, lead: LeadDetails, settings: Record<string, string>, creds: BitrixCreds,
+  ): Promise<void> {
+    if (settings.WHATSAPP_ENABLED !== 'true') {
+      this.logger.log(`WhatsApp skipped for ${agent.name} — WHATSAPP_ENABLED is off`);
+    } else if (!agent.whatsapp_phone) {
+      this.logger.log(`WhatsApp skipped for ${agent.name} — no whatsapp_phone on their agent record`);
+    } else {
+      await this.whatsapp.sendReshuffleNotification(agent.whatsapp_phone, agent.name, lead.name, lead.phone || '', lead.source);
+    }
+    if (agent.bitrix_user_id) {
+      const msg = `Recycled lead reassigned to you: ${lead.name} (${lead.phone || 'no phone'}). This one has no auto-timer — please follow up when you can.`;
+      const ok = await this.sendBitrixNotification(agent.bitrix_user_id, msg);
+      if (!ok) this.logger.warn(`Bitrix in-app notify to ${agent.name} did not go through — see reason above`);
+    }
   }
 
   // ─── SLA rotation sweep — called by CronService every couple of minutes ────
